@@ -9,17 +9,33 @@
 void Cardputer_Remote::Begin()
 {
     showTopBar = false;
-    mainOS->sprite.createSprite(SCREEN_W, SCREEN_H);
+
+    // FIX: Sprite sadece bir kez oluşturulsun
+    if (!spriteCreated)
+    {
+        mainOS->sprite.createSprite(SCREEN_W, SCREEN_H);
+        spriteCreated = true;
+    }
+
     irRecv.enableIRIn();
     irSend.begin();
+
+    sdAvailable = false;
     initSD();
-    if (sdAvailable) scanSDFiles();
-    animTimer = millis();
+
+    if (sdAvailable)
+    {
+        scanSDFiles();
+    }
+
+    animTimer  = millis();
+    needsRedraw = true;
     drawScreen();
 }
 
 void Cardputer_Remote::Loop()
 {
+    // ESC / geri tuşu
     if (mainOS->NewKey.ifKeyJustPress('`'))
     {
         if (currentState == STATE_MAIN_MENU)
@@ -29,8 +45,10 @@ void Cardputer_Remote::Loop()
         }
     }
 
+    // IR alma işlemi
     handleIRReceive();
 
+    // Klavye
     if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed())
     {
         Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
@@ -43,10 +61,14 @@ void Cardputer_Remote::Loop()
         {
             switch (status.hid_keys[0])
             {
-            case 0x28: key = '\n'; break;
-            case 0x2A: key = 127;  break;
-            case 0x29: key = '`';  break;
-            default: break;
+            case 0x28: key = '\n'; break;  // Enter
+            case 0x2A: key = 127;  break;  // Backspace
+            case 0x29: key = '`';  break;  // ESC
+            case 0x4F: key = '/';  break;  // Right arrow → sağ
+            case 0x50: key = ',';  break;  // Left arrow  → sol
+            case 0x51: key = '.';  break;  // Down arrow  → aşağı
+            case 0x52: key = ';';  break;  // Up arrow    → yukarı
+            default:   break;
             }
         }
 
@@ -68,12 +90,13 @@ void Cardputer_Remote::Loop()
         }
     }
 
+    // Animasyon gerektiren ekranlar
     if (currentState == STATE_MAIN_MENU ||
         (currentState == STATE_CAPTURE && !signalCaptured) ||
-        currentState == STATE_CAPTURE_SAVE ||
-        currentState == STATE_SEND_CONFIRM)
+        currentState == STATE_CAPTURE_SAVE)
         needsRedraw = true;
 
+    // Toast mesajı aktifse yeniden çiz
     if (statusMsg.length() > 0 && millis() - statusTime < 2500)
         needsRedraw = true;
 
@@ -82,20 +105,70 @@ void Cardputer_Remote::Loop()
         drawScreen();
         needsRedraw = false;
     }
+
     delay(16);
 }
 
 void Cardputer_Remote::Draw()   {}
-void Cardputer_Remote::OnExit() {}
+void Cardputer_Remote::OnExit()
+{
+    // Temizlik
+    capturing      = false;
+    signalCaptured = false;
+    irRecv.pause();
+}
 
 // ================================================================
-// YARDIMCI
+// YARDIMCI - STATİK
 // ================================================================
+
+// FIX: Static helper - lambda yerine güvenli static fonksiyon
+String Cardputer_Remote::trimStr(String s)
+{
+    while (s.length() > 0 &&
+           (s[0] == ' ' || s[0] == '\r' || s[0] == '\t' || s[0] == '\n'))
+        s = s.substring(1);
+    while (s.length() > 0)
+    {
+        char c = s[s.length() - 1];
+        if (c == ' ' || c == '\r' || c == '\t' || c == '\n')
+            s = s.substring(0, s.length() - 1);
+        else
+            break;
+    }
+    return s;
+}
+
+// FIX: "04 00 00 00" formatındaki hex → uint32
+// Flipper format: little-endian byte sırası
+uint32_t Cardputer_Remote::parseHexBytes(String s)
+{
+    s.replace(" ", "");
+    s.toUpperCase();
+    // s artık "04000000" gibi
+    // Flipper little-endian: byte[0] + byte[1]<<8 + ...
+    uint32_t val = 0;
+    int len = s.length();
+    // 8 hex karakter = 4 byte
+    for (int byteIdx = 0; byteIdx < 4 && (byteIdx * 2 + 1) < len; byteIdx++)
+    {
+        char hi = s[byteIdx * 2];
+        char lo = s[byteIdx * 2 + 1];
+        uint8_t bval = 0;
+        if (hi >= '0' && hi <= '9') bval = (hi - '0') << 4;
+        else if (hi >= 'A' && hi <= 'F') bval = (hi - 'A' + 10) << 4;
+        if (lo >= '0' && lo <= '9') bval |= (lo - '0');
+        else if (lo >= 'A' && lo <= 'F') bval |= (lo - 'A' + 10);
+        val |= ((uint32_t)bval << (byteIdx * 8));
+    }
+    return val;
+}
 
 void Cardputer_Remote::setStatus(String msg)
 {
     statusMsg  = msg;
     statusTime = millis();
+    needsRedraw = true;
 }
 
 String Cardputer_Remote::protoName(decode_type_t p)
@@ -114,12 +187,14 @@ String Cardputer_Remote::protoName(decode_type_t p)
     case DENON:      return "DENON";
     case PIONEER:    return "PIONEER";
     case MITSUBISHI: return "MITSUBISHI";
-    default:         return "RAW";
+    default:         return "UNKNOWN";
     }
 }
 
+// FIX: Büyük/küçük harf duyarsız karşılaştırma
 decode_type_t Cardputer_Remote::strToProto(String s)
 {
+    s.trim();
     s.toUpperCase();
     if (s == "NEC")        return NEC;
     if (s == "SONY")       return SONY;
@@ -133,81 +208,75 @@ decode_type_t Cardputer_Remote::strToProto(String s)
     if (s == "DENON")      return DENON;
     if (s == "PIONEER")    return PIONEER;
     if (s == "MITSUBISHI") return MITSUBISHI;
+    if (s == "SAMSUNG36")  return SAMSUNG;
+    if (s == "NEC1")       return NEC;
+    if (s == "NEC2")       return NEC;
     return UNKNOWN;
 }
 
 // ================================================================
-// SD KART  –  FLIPPER IR FORMAT
+// SD KART
 // ================================================================
 
 bool Cardputer_Remote::initSD()
 {
     sdAvailable = mainOS->haveSDcard;
-    if (sdAvailable && !SD.exists("/IR_Signals"))
-        SD.mkdir("/IR_Signals");
+    if (sdAvailable)
+    {
+        if (!SD.exists("/IR_Signals"))
+        {
+            SD.mkdir("/IR_Signals");
+        }
+    }
     return sdAvailable;
 }
 
 // ----------------------------------------------------------------
-//  KAYDET  –  Flipper Zero .ir formatı
-// ----------------------------------------------------------------
-//
-//  Filetype: IR signals file
-//  Version: 1
-//  #
-//  name: VOL_UP
-//  type: parsed
-//  protocol: NEC
-//  address: 04 00 00 00
-//  command: 08 00 00 00
-//  #
-//  name: BTN_RAW
-//  type: raw
-//  frequency: 38000
-//  duty_cycle: 0.330000
-//  data: 9000 4500 560 560 ...
-//
+// KAYDET - Flipper Zero .ir formatı
 // ----------------------------------------------------------------
 bool Cardputer_Remote::saveSignalToSD(IRSignal &sig)
 {
     if (!sdAvailable) return false;
+    if (sig.name.length() == 0) return false;
 
-    String fn = "/IR_Signals/" + sig.name + ".ir";
+    String fn = "/IR_Signals/" + sig.name;
     fn.replace(" ", "_");
+    if (!fn.endsWith(".ir")) fn += ".ir";
     sig.filename = fn;
 
     if (SD.exists(fn)) SD.remove(fn);
+
     File f = SD.open(fn, FILE_WRITE);
     if (!f) return false;
 
-    // Başlık
     f.println("Filetype: IR signals file");
     f.println("Version: 1");
 
-    for (auto &cmd : sig.commands)
+    for (size_t ci = 0; ci < sig.commands.size(); ci++)
     {
+        IRCommand &cmd = sig.commands[ci];
         f.println("#");
-        f.print("name: ");   f.println(cmd.label);
+        f.print("name: ");   f.println(cmd.label.length() > 0 ? cmd.label : sig.name);
         f.print("type: ");   f.println(cmd.type);
 
         if (cmd.type == "parsed")
         {
             f.print("protocol: "); f.println(cmd.protocol);
 
-            // address: "04 00 00 00" formatı
-            char buf[32];
-            uint8_t a0 =  cmd.address        & 0xFF;
-            uint8_t a1 = (cmd.address >>  8) & 0xFF;
-            uint8_t a2 = (cmd.address >> 16) & 0xFF;
-            uint8_t a3 = (cmd.address >> 24) & 0xFF;
-            sprintf(buf, "%02X %02X %02X %02X", a0, a1, a2, a3);
+            char buf[36];
+            // Flipper little-endian byte formatı
+            sprintf(buf, "%02X %02X %02X %02X",
+                    (uint8_t)(cmd.address & 0xFF),
+                    (uint8_t)((cmd.address >> 8) & 0xFF),
+                    (uint8_t)((cmd.address >> 16) & 0xFF),
+                    (uint8_t)((cmd.address >> 24) & 0xFF));
             f.print("address: "); f.println(buf);
 
-            uint8_t c0 =  cmd.command        & 0xFF;
-            uint8_t c1 = (cmd.command >>  8) & 0xFF;
-            uint8_t c2 = (cmd.command >> 16) & 0xFF;
-            uint8_t c3 = (cmd.command >> 24) & 0xFF;
-            sprintf(buf, "%02X %02X %02X %02X", c0, c1, c2, c3);
+            sprintf(buf, "%02X %02X %02X %02X",
+                    (uint8_t)(cmd.command & 0xFF),
+                    (uint8_t)((cmd.command >> 8) & 0xFF),
+                    (uint8_t)((cmd.command >> 16) & 0xFF),
+                    (uint8_t)((cmd.command >> 24) & 0xFF));
             f.print("command: "); f.println(buf);
         }
         else // raw
@@ -215,10 +284,10 @@ bool Cardputer_Remote::saveSignalToSD(IRSignal &sig)
             f.print("frequency: ");  f.println(cmd.frequency);
             f.print("duty_cycle: "); f.println(cmd.dutyCycle, 6);
             f.print("data:");
-            for (auto &v : cmd.rawData)
+            for (size_t di = 0; di < cmd.rawData.size(); di++)
             {
                 f.print(" ");
-                f.print(v);
+                f.print(cmd.rawData[di]);
             }
             f.println();
         }
@@ -229,24 +298,24 @@ bool Cardputer_Remote::saveSignalToSD(IRSignal &sig)
 }
 
 // ----------------------------------------------------------------
-//  OKU  –  Flipper Zero .ir formatı
+// OKU - Flipper Zero .ir formatı
 // ----------------------------------------------------------------
-bool Cardputer_Remote::loadSignalFromSD(String filename, IRSignal &sig)
+bool Cardputer_Remote::loadSignalFromSD(const String &filename, IRSignal &sig)
 {
+    if (!sdAvailable) return false;
+
     File f = SD.open(filename, FILE_READ);
     if (!f) return false;
 
+    sig.clear();
     sig.filename = filename;
-    sig.commands.clear();
-    sig.isMulti  = false;
-    sig.isRaw    = false;
-    sig.frequency= 38000;
 
-    // Dosya adından isim üret
+    // Dosya adından görünen ad üret
     String base = filename;
     int ls = base.lastIndexOf('/');
     if (ls >= 0) base = base.substring(ls + 1);
-    if (base.endsWith(".ir") || base.endsWith(".IR"))
+    if (base.length() > 3 &&
+        (base.endsWith(".ir") || base.endsWith(".IR")))
         base = base.substring(0, base.length() - 3);
     base.replace("_", " ");
     sig.name = base;
@@ -254,41 +323,16 @@ bool Cardputer_Remote::loadSignalFromSD(String filename, IRSignal &sig)
     IRCommand currentCmd;
     bool inBlock = false;
 
-    auto trimStr = [](String s) -> String {
-        while (s.length() > 0 && (s[0] == ' ' || s[0] == '\r' || s[0] == '\t'))
-            s = s.substring(1);
-        while (s.length() > 0 && (s[s.length()-1] == ' ' ||
-                                   s[s.length()-1] == '\r' ||
-                                   s[s.length()-1] == '\n' ||
-                                   s[s.length()-1] == '\t'))
-            s = s.substring(0, s.length()-1);
-        return s;
-    };
-
-    // Hex string "04 00 00 00" → uint32
-    auto parseHexBytes = [](String s) -> uint32_t {
-        s.replace(" ", "");
-        s.toUpperCase();
-        uint32_t val = 0;
-        for (char c : s)
-        {
-            val <<= 4;
-            if (c >= '0' && c <= '9') val |= (c - '0');
-            else if (c >= 'A' && c <= 'F') val |= (c - 'A' + 10);
-        }
-        return val;
-    };
-
     while (f.available())
     {
         String line = f.readStringUntil('\n');
         line = trimStr(line);
-
         if (line.length() == 0) continue;
 
-        // Yorum / başlık satırları
+        // Başlık satırları
         if (line.startsWith("Filetype:")) continue;
         if (line.startsWith("Version:"))  continue;
+        if (line.startsWith("# "))        continue;  // yorum
 
         // Blok ayırıcı
         if (line == "#")
@@ -297,7 +341,8 @@ bool Cardputer_Remote::loadSignalFromSD(String filename, IRSignal &sig)
             {
                 sig.commands.push_back(currentCmd);
             }
-            currentCmd = IRCommand();
+            // Yeni blok başlat
+            currentCmd          = IRCommand();
             currentCmd.frequency = 38000;
             currentCmd.dutyCycle = 0.33f;
             inBlock = true;
@@ -310,32 +355,75 @@ bool Cardputer_Remote::loadSignalFromSD(String filename, IRSignal &sig)
 
         String key = trimStr(line.substring(0, colon));
         String val = trimStr(line.substring(colon + 1));
-
         key.toLowerCase();
 
-        if      (key == "name")       currentCmd.label    = val;
-        else if (key == "type")       { val.toLowerCase(); currentCmd.type = val; }
-        else if (key == "protocol")   currentCmd.protocol = val;
-        else if (key == "address")    currentCmd.address  = parseHexBytes(val);
-        else if (key == "command")    currentCmd.command  = parseHexBytes(val);
-        else if (key == "frequency")  currentCmd.frequency= (uint32_t)val.toInt();
-        else if (key == "duty_cycle") currentCmd.dutyCycle= val.toFloat();
+        if (key == "name")
+        {
+            currentCmd.label = val;
+        }
+        else if (key == "type")
+        {
+            val.toLowerCase();
+            currentCmd.type = val;
+        }
+        else if (key == "protocol")
+        {
+            currentCmd.protocol = val;
+            currentCmd.protocol.trim();
+        }
+        else if (key == "address")
+        {
+            currentCmd.address = parseHexBytes(val);
+        }
+        else if (key == "command")
+        {
+            currentCmd.command = parseHexBytes(val);
+        }
+        else if (key == "frequency")
+        {
+            currentCmd.frequency = (uint32_t)val.toInt();
+            if (currentCmd.frequency == 0) currentCmd.frequency = 38000;
+        }
+        else if (key == "duty_cycle")
+        {
+            currentCmd.dutyCycle = val.toFloat();
+            if (currentCmd.dutyCycle <= 0.0f) currentCmd.dutyCycle = 0.33f;
+        }
         else if (key == "data")
         {
             currentCmd.rawData.clear();
-            // val: "9000 4500 560 560 ..."
-            String d = val;
-            d.trim();
+            // val içinde boşlukla ayrılmış sayılar
             int start = 0;
-            while (start < (int)d.length())
+            int dlen  = (int)val.length();
+            int count = 0;
+            while (start < dlen && count < MAX_RAW_LEN)
             {
-                int sp = d.indexOf(' ', start);
+                // Başındaki boşlukları atla
+                while (start < dlen && val[start] == ' ') start++;
+                if (start >= dlen) break;
+
+                int sp = val.indexOf(' ', start);
                 String token;
-                if (sp < 0) { token = d.substring(start); start = d.length(); }
-                else        { token = d.substring(start, sp); start = sp + 1; }
+                if (sp < 0)
+                {
+                    token = val.substring(start);
+                    start = dlen;
+                }
+                else
+                {
+                    token = val.substring(start, sp);
+                    start = sp + 1;
+                }
                 token.trim();
                 if (token.length() > 0)
-                    currentCmd.rawData.push_back((uint16_t)token.toInt());
+                {
+                    uint16_t v = (uint16_t)token.toInt();
+                    if (v > 0)
+                    {
+                        currentCmd.rawData.push_back(v);
+                        count++;
+                    }
+                }
             }
         }
     }
@@ -350,7 +438,7 @@ bool Cardputer_Remote::loadSignalFromSD(String filename, IRSignal &sig)
 
     sig.isMulti = (sig.commands.size() > 1);
 
-    // İlk komuttan hızlı erişim alanlarını doldur
+    // İlk komuttan hızlı erişim
     IRCommand &first = sig.commands[0];
     sig.protocol  = first.protocol;
     sig.address   = first.address;
@@ -363,36 +451,65 @@ bool Cardputer_Remote::loadSignalFromSD(String filename, IRSignal &sig)
 }
 
 // ----------------------------------------------------------------
-//  RECURSIVE TARAMA
+// RECURSIVE TARAMA - FIX: Stack overflow koruması + path hatası
 // ----------------------------------------------------------------
-void Cardputer_Remote::scanSDRecursive(File dir, const String &basePath)
+void Cardputer_Remote::scanSDRecursive(const String &dirPath, int depth)
 {
+    // FIX: Maksimum derinlik sınırı
+    if (depth > 4) return;
+
+    // FIX: Dosya sayısı sınırı
+    if ((int)sdFiles.size() >= 200) return;
+
+    File dir = SD.open(dirPath.length() > 0 ? dirPath : "/");
+    if (!dir) return;
+    if (!dir.isDirectory()) { dir.close(); return; }
+
     while (true)
     {
+        // FIX: Bellek koruması
+        if ((int)sdFiles.size() >= 200) break;
+
         File entry = dir.openNextFile();
         if (!entry) break;
 
+        // FIX: entry.name() tam yol değil, sadece dosya adı döner
         String entryName = String(entry.name());
+
+        // Gizli dosyaları atla
+        if (entryName.startsWith("."))
+        {
+            entry.close();
+            continue;
+        }
+
+        // FIX: Tam yolu doğru oluştur
+        String fullPath;
+        if (dirPath.length() == 0 || dirPath == "/")
+            fullPath = "/" + entryName;
+        else
+            fullPath = dirPath + "/" + entryName;
+
+        // Çift slash düzelt
+        while (fullPath.indexOf("//") >= 0)
+            fullPath.replace("//", "/");
 
         if (entry.isDirectory())
         {
-            if (entryName.startsWith(".")) { entry.close(); continue; }
-            String subPath = basePath + "/" + entryName;
-            File subDir = SD.open(subPath);
-            if (subDir) { scanSDRecursive(subDir, subPath); subDir.close(); }
+            entry.close();
+            scanSDRecursive(fullPath, depth + 1);
         }
         else
         {
             String lower = entryName;
             lower.toLowerCase();
+
             if (lower.endsWith(".ir"))
             {
-                String fullPath = basePath + "/" + entryName;
-
                 SDFileInfo info;
-                info.path     = fullPath;
-                info.isMulti  = false;
-                info.cmdCount = 1;
+                info.path    = fullPath;
+                info.isMulti = false;
+                info.cmdCount= 1;
 
                 // Görünen ad
                 String dn = entryName;
@@ -400,17 +517,23 @@ void Cardputer_Remote::scanSDRecursive(File dir, const String &basePath)
                 dn.replace("_", " ");
 
                 // Klasör prefix
-                if (basePath.length() > 0 && basePath != "/")
+                if (dirPath.length() > 1)
                 {
-                    int lsi = basePath.lastIndexOf('/');
-                    String folder = (lsi >= 0)
-                                    ? basePath.substring(lsi + 1)
-                                    : basePath;
-                    info.displayName = "[" + folder + "] " + dn;
+                    int lsi = dirPath.lastIndexOf('/');
+                    String folder = (lsi >= 0 && lsi < (int)dirPath.length() - 1)
+                                    ? dirPath.substring(lsi + 1)
+                                    : dirPath;
+                    if (folder.length() > 0 && folder != "/")
+                        info.displayName = "[" + folder + "] " + dn;
+                    else
+                        info.displayName = dn;
                 }
-                else info.displayName = dn;
+                else
+                {
+                    info.displayName = dn;
+                }
 
-                // Hızlı çoklu kontrol: '#' sayısına bak
+                // FIX: Hızlı çoklu kontrol - '#' sayısı
                 File peek = SD.open(fullPath, FILE_READ);
                 if (peek)
                 {
@@ -428,22 +551,21 @@ void Cardputer_Remote::scanSDRecursive(File dir, const String &basePath)
 
                 sdFiles.push_back(info);
             }
+            entry.close();
         }
-        entry.close();
     }
+
+    dir.close();
 }
 
 void Cardputer_Remote::scanSDFiles()
 {
     sdFiles.clear();
     if (!sdAvailable) return;
-    File root = SD.open("/");
-    if (!root) return;
-    scanSDRecursive(root, "");
-    root.close();
+    scanSDRecursive("/", 0);
 }
 
-bool Cardputer_Remote::deleteFromSD(String fn)
+bool Cardputer_Remote::deleteFromSD(const String &fn)
 {
     if (!sdAvailable) return false;
     return SD.remove(fn);
@@ -455,90 +577,116 @@ bool Cardputer_Remote::deleteFromSD(String fn)
 
 void Cardputer_Remote::reinitIRSend()
 {
-    irSend.~IRsend();
-    new (&irSend) IRsend(sendPin);
+    // FIX: Placement delete tehlikeli, begin() yeterli
     irSend.begin();
-    delay(10);
+    delay(20);
 }
 
+// FIX: Tüm protokoller için doğru bit formatı
 bool Cardputer_Remote::sendIRCommand(IRCommand &cmd)
 {
     irSend.begin();
-    delay(10);
+    delay(5);
 
     if (cmd.type == "raw")
     {
         if (cmd.rawData.empty()) return false;
-        irSend.sendRaw(cmd.rawData.data(), cmd.rawData.size(),
-                       cmd.frequency > 0 ? cmd.frequency / 1000 : 38);
+        uint16_t freq = (cmd.frequency > 0)
+                        ? (uint16_t)(cmd.frequency / 1000)
+                        : 38;
+        irSend.sendRaw(cmd.rawData.data(), (uint16_t)cmd.rawData.size(), freq);
         return true;
     }
 
-    // parsed
+    // parsed - protokol eşleştir
     decode_type_t proto = strToProto(cmd.protocol);
 
-    // NEC ve benzeri: address + command birleştir → value
-    // Flipper format: address low byte + command low byte
-    uint8_t addr = cmd.address & 0xFF;
-    uint8_t cmdB = cmd.command & 0xFF;
+    // Flipper format: address[0] = addr LSB, command[0] = cmd LSB
+    uint8_t addrByte = (uint8_t)(cmd.address & 0xFF);
+    uint8_t cmdByte  = (uint8_t)(cmd.command  & 0xFF);
 
     switch (proto)
     {
     case NEC:
     {
-        // NEC: 32bit  addrByte + ~addrByte + cmdByte + ~cmdByte
-        uint32_t val = ((uint32_t)addr << 24) |
-                       ((uint32_t)(~addr & 0xFF) << 16) |
-                       ((uint32_t)cmdB  <<  8) |
-                       ((uint32_t)(~cmdB & 0xFF));
+        // FIX: NEC standart 32bit = addr + ~addr + cmd + ~cmd (MSB first)
+        uint32_t val = ((uint32_t)addrByte        << 24) |
+                       ((uint32_t)(~addrByte&0xFF) << 16) |
+                       ((uint32_t)cmdByte          <<  8) |
+                       ((uint32_t)(~cmdByte & 0xFF));
         irSend.sendNEC(val, 32);
-        break;
+        return true;
     }
     case SAMSUNG:
     {
-        uint32_t val = ((uint32_t)addr << 24) |
-                       ((uint32_t)addr << 16) |
-                       ((uint32_t)cmdB  <<  8) |
-                       ((uint32_t)(~cmdB & 0xFF));
+        // Samsung: addr + addr + cmd + ~cmd
+        uint32_t val = ((uint32_t)addrByte        << 24) |
+                       ((uint32_t)addrByte         << 16) |
+                       ((uint32_t)cmdByte          <<  8) |
+                       ((uint32_t)(~cmdByte & 0xFF));
         irSend.sendSAMSUNG(val, 32);
-        break;
+        return true;
     }
     case SONY:
-        irSend.sendSony(cmdB, 12);
-        break;
+        // FIX: Sony 12 bit = 7 cmd + 5 addr
+        irSend.sendSony(((uint32_t)cmdByte & 0x7F) |
+                        (((uint32_t)addrByte & 0x1F) << 7), 12);
+        return true;
+
     case RC5:
-        irSend.sendRC5(cmdB, 12);
-        break;
+        irSend.sendRC5(cmdByte, 12);
+        return true;
+
     case RC6:
-        irSend.sendRC6(cmdB, 20);
-        break;
+        irSend.sendRC6(cmdByte, 20);
+        return true;
+
     case LG:
     {
-        uint32_t val = ((uint32_t)addr << 16) | ((uint32_t)cmdB << 8);
+        uint32_t val = ((uint32_t)addrByte << 16) |
+                       ((uint32_t)cmdByte  <<  8) |
+                       (uint32_t)(~cmdByte & 0xFF);
         irSend.sendLG(val, 28);
-        break;
+        return true;
     }
     case PANASONIC:
-        irSend.sendPanasonic(addr, cmdB);
-        break;
+        irSend.sendPanasonic(addrByte, cmdByte);
+        return true;
+
     case JVC:
-        irSend.sendJVC(((uint32_t)addr << 8) | cmdB, 16, 0);
-        break;
+        irSend.sendJVC(((uint32_t)addrByte << 8) | cmdByte, 16, 0);
+        return true;
+
     case SHARP:
-        irSend.sendSharpRaw(((uint32_t)addr << 8) | cmdB, 15);
-        break;
+        irSend.sendSharpRaw(((uint32_t)addrByte << 8) | cmdByte, 15);
+        return true;
+
     case DENON:
-        irSend.sendDenon(((uint32_t)addr << 8) | cmdB, 15);
-        break;
+        irSend.sendDenon(((uint32_t)addrByte << 8) | cmdByte, 15);
+        return true;
+
+    case PIONEER:
+        irSend.sendNEC(((uint32_t)addrByte << 8) | cmdByte, 32);
+        return true;
+
     default:
+        // FIX: UNKNOWN - raw data varsa kullan
         if (!cmd.rawData.empty())
         {
-            irSend.sendRaw(cmd.rawData.data(), cmd.rawData.size(), 38);
+            irSend.sendRaw(cmd.rawData.data(),
+                           (uint16_t)cmd.rawData.size(), 38);
             return true;
         }
-        return false;
+        // FIX: Raw data da yoksa NEC olarak dene
+        {
+            uint32_t val = ((uint32_t)addrByte        << 24) |
+                           ((uint32_t)(~addrByte&0xFF) << 16) |
+                           ((uint32_t)cmdByte          <<  8) |
+                           ((uint32_t)(~cmdByte & 0xFF));
+            irSend.sendNEC(val, 32);
+            return true;
+        }
     }
-    return true;
 }
 
 bool Cardputer_Remote::sendIR(IRSignal &sig)
@@ -551,7 +699,7 @@ bool Cardputer_Remote::sendIR(IRSignal &sig)
 // DRAW HELPERS
 // ================================================================
 
-void Cardputer_Remote::drawTopBar(String title)
+void Cardputer_Remote::drawTopBar(const String &title)
 {
     mainOS->sprite.fillRect(0, 0, SCREEN_W, 22, 0x111111);
     mainOS->sprite.drawFastHLine(0, 22, SCREEN_W, 0x333333);
@@ -561,29 +709,46 @@ void Cardputer_Remote::drawTopBar(String title)
     mainOS->sprite.setCursor(4, 7);
     mainOS->sprite.print("IR");
     mainOS->sprite.setTextColor(COLOR_TEXT);
-    int tx = (SCREEN_W - (int)title.length() * 6) / 2;
+
+    // Başlığı ortala
+    int tlen = title.length();
+    int tx   = (SCREEN_W - tlen * 6) / 2;
+    if (tx < 20) tx = 20;
     mainOS->sprite.setCursor(tx, 7);
     mainOS->sprite.print(title);
-    mainOS->sprite.fillCircle(SCREEN_W - 8, 11, 4, sdAvailable ? 0x004400 : 0x440000);
-    mainOS->sprite.fillCircle(SCREEN_W - 8, 11, 2, sdAvailable ? COLOR_SUCCESS : COLOR_ACCENT);
+
+    // SD durumu
+    mainOS->sprite.fillCircle(SCREEN_W - 8, 11, 4,
+                              sdAvailable ? 0x004400 : 0x440000);
+    mainOS->sprite.fillCircle(SCREEN_W - 8, 11, 2,
+                              sdAvailable ? COLOR_SUCCESS : COLOR_ACCENT);
 }
 
 void Cardputer_Remote::drawToast()
 {
     if (statusMsg.length() == 0) return;
-    if (millis() - statusTime > 2500) { statusMsg = ""; return; }
-    int w = min((int)statusMsg.length() * 6 + 16, SCREEN_W - 20);
-    int x = (SCREEN_W - w) / 2, y = SCREEN_H - 28;
+    unsigned long elapsed = millis() - statusTime;
+    if (elapsed > 2500) { statusMsg = ""; return; }
+
+    int charW = 6;
+    int w = min((int)statusMsg.length() * charW + 16, SCREEN_W - 10);
+    int x = (SCREEN_W - w) / 2;
+    int y = SCREEN_H - 28;
+
     mainOS->sprite.fillRoundRect(x, y, w, 16, 4, 0x220011);
     mainOS->sprite.drawRoundRect(x, y, w, 16, 4, 0x884466);
     mainOS->sprite.setFont(&fonts::Font0);
     mainOS->sprite.setTextSize(1);
     mainOS->sprite.setTextColor(COLOR_TEXT);
     mainOS->sprite.setCursor(x + 8, y + 4);
-    mainOS->sprite.print(statusMsg);
+    // Metni kırp
+    String msg = statusMsg;
+    int maxChars = (w - 16) / charW;
+    if ((int)msg.length() > maxChars) msg = msg.substring(0, maxChars);
+    mainOS->sprite.print(msg);
 }
 
-void Cardputer_Remote::drawBottomBar(String hint)
+void Cardputer_Remote::drawBottomBar(const String &hint)
 {
     mainOS->sprite.fillRect(0, SCREEN_H - 13, SCREEN_W, 13, 0x0A0A0A);
     mainOS->sprite.drawFastHLine(0, SCREEN_H - 13, SCREEN_W, 0x222222);
@@ -605,7 +770,7 @@ void Cardputer_Remote::drawMainMenu()
 
     for (int i = 0; i < MAIN_MENU_COUNT; i++)
     {
-        int y = MENU_START_Y + i * ITEM_H;
+        int y   = MENU_START_Y + i * ITEM_H;
         bool sel = (i == menuIndex);
         uint32_t col = menuColors[i];
 
@@ -631,13 +796,13 @@ void Cardputer_Remote::drawMainMenu()
         if (sel)
         {
             mainOS->sprite.setFont(&fonts::Font0);
-            mainOS->sprite.setTextSize(1);
             mainOS->sprite.setTextColor(TFT_WHITE);
             mainOS->sprite.setCursor(SCREEN_W - 14, y + 9);
             mainOS->sprite.print(">");
         }
     }
-    drawBottomBar(";/.: Navigate  Enter: Select  `: Exit");
+
+    drawBottomBar("Arrow/;.: Nav  Enter: Select  `: Exit");
 }
 
 // ================================================================
@@ -653,7 +818,8 @@ void Cardputer_Remote::drawCaptureScreen()
 
     if (!signalCaptured)
     {
-        uint32_t t = millis() - animTimer;
+        // Animasyon halkası
+        uint32_t t = (millis() - animTimer) % 1280;
         int r = 8 + (t / 80) % 16;
         mainOS->sprite.drawCircle(30, 78, r, 0x001866);
         mainOS->sprite.fillCircle(30, 78, 7, 0x0033BB);
@@ -669,12 +835,13 @@ void Cardputer_Remote::drawCaptureScreen()
         mainOS->sprite.print("device and press");
         mainOS->sprite.setCursor(50, 82);
         mainOS->sprite.print("a button.");
-        drawBottomBar("`/ESC: Back");
+
+        drawBottomBar("` : Back");
         needsRedraw = true;
     }
     else
     {
-        // Yakalanan sinyal bilgisi
+        if (capturedSignal.commands.empty()) return;
         IRCommand &cmd = capturedSignal.commands[0];
 
         mainOS->sprite.fillCircle(14, 42, 7, COLOR_SUCCESS);
@@ -685,19 +852,19 @@ void Cardputer_Remote::drawCaptureScreen()
         mainOS->sprite.fillRoundRect(26, 28, SCREEN_W-30, 70, 5, 0x080808);
         mainOS->sprite.drawRoundRect(26, 28, SCREEN_W-30, 70, 5, COLOR_SUCCESS);
 
-        // Protokol etiketi
-        mainOS->sprite.fillRoundRect(30, 31, cmd.protocol.length()*6+8, 12, 3, 0x002288);
+        String protoStr = cmd.protocol.length() > 0 ? cmd.protocol : "RAW";
+        mainOS->sprite.fillRoundRect(30, 31, (int)protoStr.length()*6+8, 12, 3, 0x002288);
         mainOS->sprite.setTextColor(TFT_WHITE);
         mainOS->sprite.setCursor(34, 34);
-        mainOS->sprite.print(cmd.protocol);
+        mainOS->sprite.print(protoStr);
 
         if (cmd.type == "parsed")
         {
+            char buf[16];
             mainOS->sprite.setTextColor(0x555555);
             mainOS->sprite.setCursor(30, 50);
             mainOS->sprite.print("Addr: ");
             mainOS->sprite.setTextColor(COLOR_SUCCESS);
-            char buf[12];
             sprintf(buf, "%02X %02X", cmd.address & 0xFF, (cmd.address>>8) & 0xFF);
             mainOS->sprite.print(buf);
 
@@ -714,7 +881,7 @@ void Cardputer_Remote::drawCaptureScreen()
             mainOS->sprite.setCursor(30, 50);
             mainOS->sprite.print("RAW ");
             mainOS->sprite.setTextColor(0xAAAAAA);
-            mainOS->sprite.print(cmd.rawData.size());
+            mainOS->sprite.print((int)cmd.rawData.size());
             mainOS->sprite.print(" pulses");
 
             mainOS->sprite.setTextColor(0x555555);
@@ -731,7 +898,6 @@ void Cardputer_Remote::drawCaptureScreen()
         mainOS->sprite.setTextColor(0x6688AA);
         mainOS->sprite.print(cmd.type);
 
-        // Alt butonlar
         mainOS->sprite.fillRoundRect(  4, 102, 54, 14, 3, 0x003300);
         mainOS->sprite.drawRoundRect(  4, 102, 54, 14, 3, COLOR_SUCCESS);
         mainOS->sprite.setTextColor(COLOR_SUCCESS);
@@ -756,7 +922,7 @@ void Cardputer_Remote::drawCaptureScreen()
         mainOS->sprite.setCursor(182, 105);
         mainOS->sprite.print("R: Redo");
 
-        drawBottomBar("`/ESC: Back (save prompt)");
+        drawBottomBar("S:Save T:Test V:View R:Redo `:Back");
     }
 }
 
@@ -771,7 +937,6 @@ void Cardputer_Remote::drawSavePrompt()
 
     mainOS->sprite.fillRoundRect(10, 32, SCREEN_W-20, 68, 6, 0x0A0A0A);
     mainOS->sprite.drawRoundRect(10, 32, SCREEN_W-20, 68, 6, COLOR_WARNING);
-
     mainOS->sprite.setFont(&fonts::Font0);
     mainOS->sprite.setTextSize(1);
 
@@ -786,7 +951,7 @@ void Cardputer_Remote::drawSavePrompt()
         mainOS->sprite.setCursor(18, 56);
         mainOS->sprite.print("Proto: ");
         mainOS->sprite.setTextColor(0x4488FF);
-        mainOS->sprite.print(cmd.protocol);
+        mainOS->sprite.print(cmd.protocol.length() > 0 ? cmd.protocol : "RAW");
 
         mainOS->sprite.setTextColor(0x444444);
         mainOS->sprite.setCursor(18, 68);
@@ -801,7 +966,7 @@ void Cardputer_Remote::drawSavePrompt()
         {
             mainOS->sprite.setTextColor(0x666666);
             mainOS->sprite.print("RAW ");
-            mainOS->sprite.print(cmd.rawData.size());
+            mainOS->sprite.print((int)cmd.rawData.size());
             mainOS->sprite.print(" pulses");
         }
     }
@@ -816,7 +981,7 @@ void Cardputer_Remote::drawSavePrompt()
     mainOS->sprite.drawRoundRect(118, 82, 100, 16, 4, COLOR_ACCENT);
     mainOS->sprite.setTextColor(COLOR_ACCENT);
     mainOS->sprite.setCursor(128, 86);
-    mainOS->sprite.print("N - No, Discard");
+    mainOS->sprite.print("N - Discard");
 }
 
 // ================================================================
@@ -830,7 +995,6 @@ void Cardputer_Remote::drawSaveDialog()
 
     mainOS->sprite.fillRoundRect(6, 26, SCREEN_W-12, 90, 6, 0x080808);
     mainOS->sprite.drawRoundRect(6, 26, SCREEN_W-12, 90, 6, 0x0055FF);
-
     mainOS->sprite.setFont(&fonts::Font0);
     mainOS->sprite.setTextSize(1);
 
@@ -842,12 +1006,17 @@ void Cardputer_Remote::drawSaveDialog()
     mainOS->sprite.drawRoundRect(14, 46, SCREEN_W-28, 18, 3, 0x0055FF);
     mainOS->sprite.setTextColor(TFT_WHITE);
     mainOS->sprite.setCursor(18, 50);
+
     String disp = inputText;
-    if (disp.length() > 24) disp = disp.substring(disp.length() - 24);
+    int maxDisplay = 24;
+    if ((int)disp.length() > maxDisplay)
+        disp = disp.substring(disp.length() - maxDisplay);
     mainOS->sprite.print(disp);
+
+    // İmleç
     if ((millis() / 400) % 2 == 0)
     {
-        int cx = 18 + disp.length() * 6;
+        int cx = 18 + (int)disp.length() * 6;
         if (cx < SCREEN_W - 18)
             mainOS->sprite.drawFastVLine(cx, 48, 12, 0x0088FF);
     }
@@ -859,7 +1028,7 @@ void Cardputer_Remote::drawSaveDialog()
         mainOS->sprite.setCursor(14, 72);
         mainOS->sprite.print("Proto: ");
         mainOS->sprite.setTextColor(0x4488FF);
-        mainOS->sprite.print(cmd.protocol);
+        mainOS->sprite.print(cmd.protocol.length() > 0 ? cmd.protocol : "RAW");
         mainOS->sprite.setTextColor(0x444444);
         mainOS->sprite.print("  Type: ");
         mainOS->sprite.setTextColor(0x4488FF);
@@ -868,9 +1037,9 @@ void Cardputer_Remote::drawSaveDialog()
 
     mainOS->sprite.setTextColor(0x333333);
     mainOS->sprite.setCursor(14, 84);
-    mainOS->sprite.print("File: /IR_Signals/");
+    mainOS->sprite.print("/IR_Signals/");
     mainOS->sprite.setTextColor(0x555555);
-    String fn = inputText.length() > 0 ? inputText : "?";
+    String fn = (inputText.length() > 0) ? inputText : "?";
     fn.replace(" ", "_");
     mainOS->sprite.print(fn + ".ir");
 
@@ -878,13 +1047,13 @@ void Cardputer_Remote::drawSaveDialog()
     mainOS->sprite.drawRoundRect( 14, 100,  80, 14, 3, COLOR_SUCCESS);
     mainOS->sprite.setTextColor(COLOR_SUCCESS);
     mainOS->sprite.setCursor(20, 103);
-    mainOS->sprite.print("ENTER: Save");
+    mainOS->sprite.print("Enter: Save");
 
     mainOS->sprite.fillRoundRect(102, 100, 124, 14, 3, 0x220000);
     mainOS->sprite.drawRoundRect(102, 100, 124, 14, 3, COLOR_ACCENT);
     mainOS->sprite.setTextColor(COLOR_ACCENT);
     mainOS->sprite.setCursor(108, 103);
-    mainOS->sprite.print("`/ESC: Cancel");
+    mainOS->sprite.print("`: Cancel");
 
     needsRedraw = true;
 }
@@ -897,7 +1066,6 @@ void Cardputer_Remote::drawViewCodeScreen()
 {
     mainOS->sprite.fillScreen(COLOR_BG);
     drawTopBar("IR CODE DETAIL");
-
     mainOS->sprite.setFont(&fonts::Font0);
     mainOS->sprite.setTextSize(1);
 
@@ -911,8 +1079,8 @@ void Cardputer_Remote::drawViewCodeScreen()
     }
 
     IRCommand &cmd = selectedSignal.commands[0];
+    String protoStr = cmd.protocol.length() > 0 ? cmd.protocol : "RAW";
 
-    // Protokol kutusu
     mainOS->sprite.fillRoundRect(2, 26, 90, 26, 4, 0x090909);
     mainOS->sprite.drawRoundRect(2, 26, 90, 26, 4, 0x0033AA);
     mainOS->sprite.setTextColor(0x334466);
@@ -920,9 +1088,8 @@ void Cardputer_Remote::drawViewCodeScreen()
     mainOS->sprite.print("Protocol");
     mainOS->sprite.setTextColor(0x4488FF);
     mainOS->sprite.setCursor(6, 40);
-    mainOS->sprite.print(cmd.protocol.length() > 0 ? cmd.protocol : "RAW");
+    mainOS->sprite.print(protoStr);
 
-    // Type kutusu
     mainOS->sprite.fillRoundRect(96, 26, 60, 26, 4, 0x090909);
     mainOS->sprite.drawRoundRect(96, 26, 60, 26, 4, 0x003300);
     mainOS->sprite.setTextColor(0x224422);
@@ -932,7 +1099,6 @@ void Cardputer_Remote::drawViewCodeScreen()
     mainOS->sprite.setCursor(100, 40);
     mainOS->sprite.print(cmd.type);
 
-    // Freq kutusu
     mainOS->sprite.fillRoundRect(160, 26, 78, 26, 4, 0x090909);
     mainOS->sprite.drawRoundRect(160, 26, 78, 26, 4, 0x332200);
     mainOS->sprite.setTextColor(0x443322);
@@ -944,20 +1110,20 @@ void Cardputer_Remote::drawViewCodeScreen()
 
     if (cmd.type == "parsed")
     {
-        // Address
+        char buf[36];
         mainOS->sprite.fillRoundRect(2, 56, SCREEN_W-4, 16, 3, 0x080808);
         mainOS->sprite.drawRoundRect(2, 56, SCREEN_W-4, 16, 3, 0x222222);
         mainOS->sprite.setTextColor(0x444444);
         mainOS->sprite.setCursor(6, 60);
         mainOS->sprite.print("Address: ");
         mainOS->sprite.setTextColor(COLOR_SUCCESS);
-        char buf[32];
         sprintf(buf, "%02X %02X %02X %02X",
-                cmd.address & 0xFF, (cmd.address>>8)&0xFF,
-                (cmd.address>>16)&0xFF, (cmd.address>>24)&0xFF);
+                (uint8_t)(cmd.address & 0xFF),
+                (uint8_t)((cmd.address >> 8)  & 0xFF),
+                (uint8_t)((cmd.address >> 16) & 0xFF),
+                (uint8_t)((cmd.address >> 24) & 0xFF));
         mainOS->sprite.print(buf);
 
-        // Command
         mainOS->sprite.fillRoundRect(2, 76, SCREEN_W-4, 16, 3, 0x080808);
         mainOS->sprite.drawRoundRect(2, 76, SCREEN_W-4, 16, 3, 0x222222);
         mainOS->sprite.setTextColor(0x444444);
@@ -965,22 +1131,22 @@ void Cardputer_Remote::drawViewCodeScreen()
         mainOS->sprite.print("Command: ");
         mainOS->sprite.setTextColor(0xCCCCCC);
         sprintf(buf, "%02X %02X %02X %02X",
-                cmd.command & 0xFF, (cmd.command>>8)&0xFF,
-                (cmd.command>>16)&0xFF, (cmd.command>>24)&0xFF);
+                (uint8_t)(cmd.command & 0xFF),
+                (uint8_t)((cmd.command >> 8)  & 0xFF),
+                (uint8_t)((cmd.command >> 16) & 0xFF),
+                (uint8_t)((cmd.command >> 24) & 0xFF));
         mainOS->sprite.print(buf);
     }
     else
     {
-        // RAW bilgi
         mainOS->sprite.fillRoundRect(2, 56, SCREEN_W-4, 16, 3, 0x080808);
         mainOS->sprite.drawRoundRect(2, 56, SCREEN_W-4, 16, 3, 0x222222);
         mainOS->sprite.setTextColor(0x444444);
         mainOS->sprite.setCursor(6, 60);
         mainOS->sprite.print("Pulses: ");
         mainOS->sprite.setTextColor(COLOR_WARNING);
-        mainOS->sprite.print(cmd.rawData.size());
+        mainOS->sprite.print((int)cmd.rawData.size());
 
-        // İlk birkaç raw değer
         mainOS->sprite.fillRoundRect(2, 76, SCREEN_W-4, 16, 3, 0x080808);
         mainOS->sprite.drawRoundRect(2, 76, SCREEN_W-4, 16, 3, 0x222222);
         mainOS->sprite.setTextColor(0x444444);
@@ -988,24 +1154,24 @@ void Cardputer_Remote::drawViewCodeScreen()
         mainOS->sprite.print("Data: ");
         mainOS->sprite.setTextColor(0x666666);
         String preview = "";
-        for (int i = 0; i < min((int)cmd.rawData.size(), 5); i++)
+        int showN = min((int)cmd.rawData.size(), 5);
+        for (int i = 0; i < showN; i++)
         {
+            if (i > 0) preview += " ";
             preview += String(cmd.rawData[i]);
-            if (i < 4 && i < (int)cmd.rawData.size()-1) preview += " ";
         }
         if ((int)cmd.rawData.size() > 5) preview += "...";
         mainOS->sprite.print(preview);
     }
 
-    // Dosya adı
     mainOS->sprite.setTextColor(0x333333);
     mainOS->sprite.setCursor(6, 100);
     mainOS->sprite.print("File: ");
     mainOS->sprite.setTextColor(0x555555);
     String fn = selectedSignal.filename;
-    int ls = fn.lastIndexOf('/');
-    if (ls >= 0) fn = fn.substring(ls + 1);
-    if (fn.length() > 22) fn = fn.substring(0, 22) + "..";
+    int ls2 = fn.lastIndexOf('/');
+    if (ls2 >= 0) fn = fn.substring(ls2 + 1);
+    if ((int)fn.length() > 22) fn = fn.substring(0, 22) + "..";
     mainOS->sprite.print(fn);
 
     drawBottomBar("Enter/S: Send    `: Back");
@@ -1018,34 +1184,40 @@ void Cardputer_Remote::drawViewCodeScreen()
 void Cardputer_Remote::drawSDBrowserScreen()
 {
     mainOS->sprite.fillScreen(COLOR_BG);
-    drawTopBar("SD BROWSER (.ir)");
+    drawTopBar("SD BROWSER");
     mainOS->sprite.setFont(&fonts::Font0);
     mainOS->sprite.setTextSize(1);
 
     if (!sdAvailable)
     {
         mainOS->sprite.setTextColor(COLOR_ACCENT);
-        mainOS->sprite.setCursor(SCREEN_W/2-48, 52);
+        mainOS->sprite.setCursor(SCREEN_W/2 - 54, 52);
         mainOS->sprite.print("SD Card not found!");
         mainOS->sprite.setTextColor(0x444444);
-        mainOS->sprite.setCursor(SCREEN_W/2-54, 66);
+        mainOS->sprite.setCursor(SCREEN_W/2 - 60, 66);
         mainOS->sprite.print("Insert card & restart");
-        drawBottomBar("` : Back");
+        drawBottomBar("R: Refresh  ` : Back");
         return;
     }
 
     if (sdFiles.empty())
     {
         mainOS->sprite.setTextColor(0x444444);
-        mainOS->sprite.setCursor(SCREEN_W/2-54, 52);
+        mainOS->sprite.setCursor(SCREEN_W/2 - 54, 52);
         mainOS->sprite.print("No .ir files on SD");
-        mainOS->sprite.setCursor(SCREEN_W/2-52, 66);
-        mainOS->sprite.print("(all folders searched)");
+        mainOS->sprite.setCursor(SCREEN_W/2 - 54, 66);
+        mainOS->sprite.print("(all folders scanned)");
         drawBottomBar("R: Refresh   ` : Back");
         return;
     }
 
-    int visN = 4, itemH = 24, startY = 26;
+    const int visN   = 4;
+    const int itemH  = 24;
+    const int startY = 26;
+
+    // Scroll ayarla
+    if (sdFileIndex < 0) sdFileIndex = 0;
+    if (sdFileIndex >= (int)sdFiles.size()) sdFileIndex = (int)sdFiles.size() - 1;
     if (sdFileIndex < scrollOffset) scrollOffset = sdFileIndex;
     if (sdFileIndex >= scrollOffset + visN) scrollOffset = sdFileIndex - visN + 1;
 
@@ -1053,6 +1225,7 @@ void Cardputer_Remote::drawSDBrowserScreen()
     {
         int idx = i + scrollOffset;
         if (idx >= (int)sdFiles.size()) break;
+
         int  y   = startY + i * itemH;
         bool sel = (idx == sdFileIndex);
         bool isM = sdFiles[idx].isMulti;
@@ -1073,49 +1246,50 @@ void Cardputer_Remote::drawSDBrowserScreen()
             mainOS->sprite.drawRoundRect(2, y, SCREEN_W-4, itemH-2, 3, 0x1A1A1A);
         }
 
-        // İkon
         mainOS->sprite.setTextColor(sel ? selBar : (isM ? 0x443300 : 0x336633));
         mainOS->sprite.setCursor(6, y + 4);
         mainOS->sprite.print(isM ? "[M]" : ".ir");
 
-        // Görünen ad
         String dn = sdFiles[idx].displayName;
-        if (dn.length() > 23) dn = dn.substring(0, 23) + "..";
+        if ((int)dn.length() > 23) dn = dn.substring(0, 23) + "..";
         mainOS->sprite.setTextColor(sel ? TFT_WHITE : 0x777777);
         mainOS->sprite.setCursor(32, y + 4);
         mainOS->sprite.print(dn);
 
         // Alt bilgi
         String sub = isM
-                     ? (String(sdFiles[idx].cmdCount) + " cmds")
-                     : (String(idx+1) + "/" + String(sdFiles.size()));
+            ? (String(sdFiles[idx].cmdCount) + " cmds")
+            : (String(idx + 1) + "/" + String(sdFiles.size()));
         mainOS->sprite.setTextColor(sel ? 0x557755 : 0x2A2A2A);
-        mainOS->sprite.setCursor(SCREEN_W - sub.length()*6 - 6, y + 14);
+        mainOS->sprite.setCursor(SCREEN_W - (int)sub.length() * 6 - 6, y + 14);
         mainOS->sprite.print(sub);
     }
 
     // Scrollbar
     if ((int)sdFiles.size() > visN)
     {
-        int sbH = visN * itemH, sbX = SCREEN_W-3, sbY = startY;
+        int sbH = visN * itemH;
+        int sbX = SCREEN_W - 3;
+        int sbY = startY;
         mainOS->sprite.fillRect(sbX, sbY, 2, sbH, 0x111111);
-        int th = sbH * visN / sdFiles.size();
-        int ty = sbY + sbH * scrollOffset / sdFiles.size();
+        int th = sbH * visN / (int)sdFiles.size();
+        if (th < 4) th = 4;
+        int ty = sbY + sbH * scrollOffset / (int)sdFiles.size();
         mainOS->sprite.fillRect(sbX, ty, 2, th, COLOR_SUCCESS);
     }
 
-    drawBottomBar(";/.: Nav  Ent:Open  V:Detail  R:Refresh  `:Back");
+    drawBottomBar("Arrow:Nav  Ent:Open  V:Detail  R:Scan  `:Back");
 }
 
 // ================================================================
-// REMOTE PAD  (çoklu komut kumanda ekranı)
+// REMOTE PAD
 // ================================================================
 
 void Cardputer_Remote::drawRemotePad()
 {
     mainOS->sprite.fillScreen(COLOR_BG);
     String title = selectedSignal.name;
-    if (title.length() > 16) title = title.substring(0, 16) + "..";
+    if ((int)title.length() > 16) title = title.substring(0, 16) + "..";
     drawTopBar(title);
 
     mainOS->sprite.setFont(&fonts::Font0);
@@ -1131,26 +1305,25 @@ void Cardputer_Remote::drawRemotePad()
         return;
     }
 
-    // Kullanılabilir alan
-    int areaX = 2, areaY = 24;
-    int areaW = SCREEN_W - 4;
-    int areaH = SCREEN_H - 24 - 15;   // 96 px
-
     // Sütun sayısı
     int cols = 3;
-    if (cmdCount <= 2)  cols = cmdCount;
-    if (cmdCount >= 9)  cols = 4;
-    if (cmdCount == 1)  cols = 1;
+    if (cmdCount == 1) cols = 1;
+    else if (cmdCount <= 2) cols = 2;
+    else if (cmdCount >= 9) cols = 4;
 
-    int rows    = (cmdCount + cols - 1) / cols;
-    int btnW    = areaW / cols;
-    int btnH    = min(areaH / max(rows, 1), 30);
+    int rows = (cmdCount + cols - 1) / cols;
+    int areaY = 25;
+    int areaH = SCREEN_H - areaY - 15;
+    int areaW = SCREEN_W - 4;
+
+    int btnW = areaW / cols;
+    int btnH = (rows > 0) ? min(areaH / rows, 30) : 30;
 
     for (int i = 0; i < cmdCount; i++)
     {
         int col = i % cols;
         int row = i / cols;
-        int bx  = areaX + col * btnW;
+        int bx  = 2 + col * btnW;
         int by  = areaY + row * btnH;
         int bw  = btnW - 2;
         int bh  = btnH - 2;
@@ -1170,7 +1343,7 @@ void Cardputer_Remote::drawRemotePad()
         }
 
         String lbl = selectedSignal.commands[i].label;
-        if (lbl.length() > 7) lbl = lbl.substring(0, 7);
+        if ((int)lbl.length() > 7) lbl = lbl.substring(0, 7);
         int tx = bx + (bw - (int)lbl.length() * 6) / 2;
         int ty = by + (bh - 8) / 2;
         mainOS->sprite.setTextColor(sel ? COLOR_WARNING : 0x777777);
@@ -1179,23 +1352,26 @@ void Cardputer_Remote::drawRemotePad()
     }
 
     // Seçili buton detayı
-    if (remotePadIdx < cmdCount)
+    if (remotePadIdx >= 0 && remotePadIdx < cmdCount)
     {
         IRCommand &sc = selectedSignal.commands[remotePadIdx];
-        mainOS->sprite.setTextColor(0x444444);
-        mainOS->sprite.setCursor(4, SCREEN_H - 24);
-        String info = sc.label + " [" + (sc.protocol.length()>0 ? sc.protocol : "RAW") + "]";
+        String protoStr = sc.protocol.length() > 0 ? sc.protocol : "RAW";
+        String info = sc.label + " [" + protoStr + "]";
         if (sc.type == "parsed")
         {
             char buf[20];
-            sprintf(buf, " A:%02X C:%02X", sc.address & 0xFF, sc.command & 0xFF);
+            sprintf(buf, " A:%02X C:%02X",
+                    (uint8_t)(sc.address & 0xFF),
+                    (uint8_t)(sc.command & 0xFF));
             info += String(buf);
         }
-        if (info.length() > 34) info = info.substring(0, 34);
+        if ((int)info.length() > 34) info = info.substring(0, 34);
+        mainOS->sprite.setTextColor(0x444444);
+        mainOS->sprite.setCursor(4, SCREEN_H - 24);
         mainOS->sprite.print(info);
     }
 
-    drawBottomBar(";/.,/: Nav  Enter:Send  `:Back");
+    drawBottomBar("Arrow:Nav  Enter:Send  `:Back");
 }
 
 // ================================================================
@@ -1222,9 +1398,8 @@ void Cardputer_Remote::drawSendConfirm(bool sending)
         mainOS->sprite.print(">>>");
         mainOS->sprite.setTextSize(1);
         mainOS->sprite.setTextColor(0x777777);
-        mainOS->sprite.setCursor(SCREEN_W/2-36, 82);
+        mainOS->sprite.setCursor(SCREEN_W/2 - 40, 82);
         mainOS->sprite.print("Transmitting...");
-        needsRedraw = true;
     }
     else
     {
@@ -1235,25 +1410,26 @@ void Cardputer_Remote::drawSendConfirm(bool sending)
         mainOS->sprite.setTextColor(TFT_WHITE);
         mainOS->sprite.setCursor(14, 46);
         String nm = selectedSignal.name;
-        if (nm.length() > 26) nm = nm.substring(0, 26) + "..";
+        if ((int)nm.length() > 26) nm = nm.substring(0, 26) + "..";
         mainOS->sprite.print(nm);
 
         if (!selectedSignal.commands.empty())
         {
             IRCommand &cmd = selectedSignal.commands[0];
             String pt = cmd.protocol.length() > 0 ? cmd.protocol : "RAW";
-            int pw = pt.length() * 6 + 8;
+            int pw = (int)pt.length() * 6 + 8;
             mainOS->sprite.fillRoundRect(14, 58, pw, 12, 3, 0x001A44);
             mainOS->sprite.setTextColor(0x4488FF);
             mainOS->sprite.setCursor(18, 61);
             mainOS->sprite.print(pt);
 
-            mainOS->sprite.setTextColor(0x333333);
             mainOS->sprite.setCursor(14, 74);
             if (cmd.type == "parsed")
             {
                 char buf[24];
-                sprintf(buf, "A:%02X C:%02X", cmd.address & 0xFF, cmd.command & 0xFF);
+                sprintf(buf, "A:%02X C:%02X",
+                        (uint8_t)(cmd.address & 0xFF),
+                        (uint8_t)(cmd.command & 0xFF));
                 mainOS->sprite.setTextColor(0x555555);
                 mainOS->sprite.print(buf);
             }
@@ -1261,7 +1437,7 @@ void Cardputer_Remote::drawSendConfirm(bool sending)
             {
                 mainOS->sprite.setTextColor(0x555555);
                 mainOS->sprite.print("RAW ");
-                mainOS->sprite.print(cmd.rawData.size());
+                mainOS->sprite.print((int)cmd.rawData.size());
                 mainOS->sprite.print(" pulses");
             }
         }
@@ -1276,7 +1452,7 @@ void Cardputer_Remote::drawSendConfirm(bool sending)
         mainOS->sprite.drawRoundRect(114, 92, 110, 14, 4, COLOR_ACCENT);
         mainOS->sprite.setTextColor(COLOR_ACCENT);
         mainOS->sprite.setCursor(120, 95);
-        mainOS->sprite.print("`/ESC: Cancel");
+        mainOS->sprite.print("`: Cancel");
     }
 }
 
@@ -1295,10 +1471,10 @@ void Cardputer_Remote::drawSettingsScreen()
     mainOS->sprite.drawRoundRect(4, 26, SCREEN_W-8, 36, 5, 0x333333);
     mainOS->sprite.setTextColor(0x446644);
     mainOS->sprite.setCursor(10, 32);
-    mainOS->sprite.print("Receiver : PIN G1  (fixed)");
+    mainOS->sprite.print("Recv: PIN G1  (fixed)");
     mainOS->sprite.setTextColor(0x444488);
     mainOS->sprite.setCursor(10, 44);
-    mainOS->sprite.print("Format   : Flipper Zero .ir");
+    mainOS->sprite.print("Format: Flipper Zero .ir");
 
     mainOS->sprite.drawFastHLine(4, 66, SCREEN_W-8, 0x222222);
     mainOS->sprite.setTextColor(0x886600);
@@ -1341,7 +1517,7 @@ void Cardputer_Remote::drawSettingsScreen()
         mainOS->sprite.print("[ACTIVE]");
     }
 
-    drawBottomBar(",/.: Select  Enter: Apply  `: Back");
+    drawBottomBar("Arrow:Sel  Enter:Apply  `:Back");
 }
 
 // ================================================================
@@ -1352,15 +1528,16 @@ void Cardputer_Remote::drawScreen()
 {
     switch (currentState)
     {
-    case STATE_MAIN_MENU:    drawMainMenu();        break;
-    case STATE_CAPTURE:      drawCaptureScreen();   break;
-    case STATE_SAVE_PROMPT:  drawSavePrompt();      break;
-    case STATE_CAPTURE_SAVE: drawSaveDialog();      break;
-    case STATE_VIEW_CODE:    drawViewCodeScreen();  break;
-    case STATE_SD_BROWSER:   drawSDBrowserScreen(); break;
-    case STATE_SEND_CONFIRM: drawSendConfirm(false);break;
-    case STATE_SETTINGS:     drawSettingsScreen();  break;
-    case STATE_REMOTE_PAD:   drawRemotePad();       break;
+    case STATE_MAIN_MENU:    drawMainMenu();         break;
+    case STATE_CAPTURE:      drawCaptureScreen();    break;
+    case STATE_SAVE_PROMPT:  drawSavePrompt();       break;
+    case STATE_CAPTURE_SAVE: drawSaveDialog();       break;
+    case STATE_VIEW_CODE:    drawViewCodeScreen();   break;
+    case STATE_SD_BROWSER:   drawSDBrowserScreen();  break;
+    case STATE_SEND_CONFIRM: drawSendConfirm(false); break;
+    case STATE_SETTINGS:     drawSettingsScreen();   break;
+    case STATE_REMOTE_PAD:   drawRemotePad();        break;
+    default:                 drawMainMenu();         break;
     }
     drawToast();
     mainOS->sprite.pushSprite(0, 0);
@@ -1375,59 +1552,83 @@ void Cardputer_Remote::handleIRReceive()
     if (!capturing || signalCaptured) return;
     if (!irRecv.decode(&irResults))   return;
 
-    if (irResults.value != 0xFFFFFFFF &&
-        irResults.value != 0x0 &&
-        millis() - lastCapture > 300)
+    uint32_t val = (uint32_t)irResults.value;
+
+    // Tekrar kodu ve sıfır değerini filtrele
+    if (val == 0xFFFFFFFF || val == 0x00000000 ||
+        millis() - lastCapture < 300)
     {
-        // IRCommand oluştur
-        IRCommand cmd;
-        cmd.label    = "BTN";
-        cmd.frequency= 38000;
-        cmd.dutyCycle= 0.33f;
-
-        bool isRaw = (irResults.decode_type == UNKNOWN);
-
-        if (isRaw)
-        {
-            cmd.type     = "raw";
-            cmd.protocol = "";
-            cmd.address  = 0;
-            cmd.command  = 0;
-            for (int i = 1; i < irResults.rawlen && i < 512; i++)
-                cmd.rawData.push_back((uint16_t)(irResults.rawbuf[i] * RAWTICK));
-        }
-        else
-        {
-            cmd.type     = "parsed";
-            cmd.protocol = protoName(irResults.decode_type);
-            // Flipper format: address = low byte, command = next byte
-            // IRremote value genellikle: [addr][~addr][cmd][~cmd]  (NEC için)
-            uint32_t val = (uint32_t)irResults.value;
-            cmd.address  = val & 0xFF;
-            cmd.command  = (val >> 8) & 0xFF;
-        }
-
-        capturedSignal.name     = "IR_" + String(millis() % 100000);
-        capturedSignal.filename = "";
-        capturedSignal.isMulti  = false;
-        capturedSignal.isRaw    = isRaw;
-        capturedSignal.commands.clear();
-        capturedSignal.commands.push_back(cmd);
-
-        // Hızlı erişim alanları
-        capturedSignal.protocol = cmd.protocol;
-        capturedSignal.address  = cmd.address;
-        capturedSignal.command  = cmd.command;
-        capturedSignal.frequency= cmd.frequency;
-        capturedSignal.rawData  = cmd.rawData;
-
-        signalCaptured = true;
-        lastCapture    = millis();
-        capturing      = false;
-        irRecv.pause();
-        needsRedraw = true;
+        irRecv.resume();
+        return;
     }
-    irRecv.resume();
+
+    IRCommand cmd;
+    cmd.label     = "BTN";
+    cmd.frequency = 38000;
+    cmd.dutyCycle = 0.33f;
+
+    bool isRaw = (irResults.decode_type == UNKNOWN);
+
+    if (isRaw)
+    {
+        cmd.type     = "raw";
+        cmd.protocol = "";
+        cmd.address  = 0;
+        cmd.command  = 0;
+
+        // FIX: rawbuf sınırlı kopyalama
+        int copyLen = min((int)irResults.rawlen - 1, MAX_RAW_LEN);
+        cmd.rawData.reserve(copyLen);
+        for (int i = 1; i <= copyLen; i++)
+        {
+            uint16_t pulse = (uint16_t)(irResults.rawbuf[i] * RAWTICK);
+            if (pulse > 0) cmd.rawData.push_back(pulse);
+        }
+    }
+    else
+    {
+        cmd.type     = "parsed";
+        cmd.protocol = protoName(irResults.decode_type);
+
+        // Flipper format: address = addr byte, command = cmd byte
+        // NEC: bits 31-24 = addr, 23-16 = ~addr, 15-8 = cmd, 7-0 = ~cmd
+        switch (irResults.decode_type)
+        {
+        case NEC:
+            cmd.address = (val >> 24) & 0xFF;
+            cmd.command = (val >> 8) & 0xFF;
+            break;
+        case SAMSUNG:
+            cmd.address = (val >> 24) & 0xFF;
+            cmd.command = (val >> 8) & 0xFF;
+            break;
+        case SONY:
+            cmd.command = val & 0x7F;
+            cmd.address = (val >> 7) & 0x1F;
+            break;
+        default:
+            cmd.address = val & 0xFF;
+            cmd.command = (val >> 8) & 0xFF;
+            break;
+        }
+    }
+
+    capturedSignal.clear();
+    capturedSignal.name    = "IR_" + String(millis() % 100000);
+    capturedSignal.isRaw   = isRaw;
+    capturedSignal.isMulti = false;
+    capturedSignal.commands.push_back(cmd);
+    capturedSignal.protocol = cmd.protocol;
+    capturedSignal.address  = cmd.address;
+    capturedSignal.command  = cmd.command;
+    capturedSignal.frequency= cmd.frequency;
+    capturedSignal.rawData  = cmd.rawData;
+
+    signalCaptured = true;
+    lastCapture    = millis();
+    capturing      = false;
+    irRecv.pause();
+    needsRedraw    = true;
 }
 
 // ================================================================
@@ -1449,10 +1650,11 @@ void Cardputer_Remote::handleMainMenu(char key)
             currentState   = STATE_CAPTURE;
             signalCaptured = false;
             capturing      = true;
-            irRecv.resume();
+            irRecv.enableIRIn();
             animTimer = millis();
             break;
         case 1:
+            if (!sdAvailable) initSD();
             scanSDFiles();
             currentState = STATE_SD_BROWSER;
             sdFileIndex  = 0;
@@ -1470,33 +1672,42 @@ void Cardputer_Remote::handleCapture(char key)
 {
     if (key == '`' || key == 27)
     {
-        if (signalCaptured) currentState = STATE_SAVE_PROMPT;
-        else { capturing = false; irRecv.pause(); currentState = STATE_MAIN_MENU; }
+        if (signalCaptured)
+            currentState = STATE_SAVE_PROMPT;
+        else
+        {
+            capturing = false;
+            irRecv.pause();
+            currentState = STATE_MAIN_MENU;
+        }
+        return;
     }
-    else if (signalCaptured)
+
+    if (!signalCaptured) return;
+
+    if (key == 's' || key == 'S')
     {
-        if (key == 's' || key == 'S')
-        {
-            if (sdAvailable) { currentState = STATE_CAPTURE_SAVE; inputText = ""; }
-            else setStatus("SD Card not available!");
-        }
-        else if (key == 't' || key == 'T')
-        {
-            setStatus(sendIR(capturedSignal) ? "Signal sent!" : "Send failed!");
-        }
-        else if (key == 'v' || key == 'V')
-        {
-            selectedSignal = capturedSignal;
-            previousState  = STATE_CAPTURE;
-            currentState   = STATE_VIEW_CODE;
-        }
-        else if (key == 'r' || key == 'R')
-        {
-            signalCaptured = false;
-            capturing      = true;
-            irRecv.resume();
-            animTimer = millis();
-        }
+        if (sdAvailable) { currentState = STATE_CAPTURE_SAVE; inputText = ""; }
+        else setStatus("SD not available!");
+    }
+    else if (key == 't' || key == 'T')
+    {
+        bool ok = sendIR(capturedSignal);
+        setStatus(ok ? "Signal sent!" : "Send failed!");
+    }
+    else if (key == 'v' || key == 'V')
+    {
+        selectedSignal = capturedSignal;
+        previousState  = STATE_CAPTURE;
+        currentState   = STATE_VIEW_CODE;
+    }
+    else if (key == 'r' || key == 'R')
+    {
+        signalCaptured = false;
+        capturing      = true;
+        capturedSignal.clear();
+        irRecv.enableIRIn();
+        animTimer = millis();
     }
 }
 
@@ -1509,9 +1720,11 @@ void Cardputer_Remote::handleSavePrompt(char key)
     }
     else if (key == 'n' || key == 'N' || key == '`' || key == 27)
     {
-        capturing = false; irRecv.pause();
+        capturing      = false;
+        irRecv.pause();
         signalCaptured = false;
-        currentState = STATE_MAIN_MENU;
+        capturedSignal.clear();
+        currentState   = STATE_MAIN_MENU;
     }
 }
 
@@ -1520,44 +1733,65 @@ void Cardputer_Remote::handleSaveDialog(char key)
     if (key == '`' || key == 27)
     {
         currentState = STATE_CAPTURE;
+        return;
     }
-    else if (key == '\n' || key == '\r')
-    {
-        if (inputText.length() == 0) { setStatus("Name cannot be empty!"); return; }
 
-        // İsmi ve label'ı güncelle
+    if (key == '\n' || key == '\r')
+    {
+        if (inputText.length() == 0)
+        {
+            setStatus("Name cannot be empty!");
+            return;
+        }
         capturedSignal.name = inputText;
         if (!capturedSignal.commands.empty())
             capturedSignal.commands[0].label = inputText;
 
         if (saveSignalToSD(capturedSignal))
         {
-            // sdFiles listesini güncelle
             scanSDFiles();
             setStatus("Saved: " + inputText + ".ir");
             currentState   = STATE_MAIN_MENU;
             signalCaptured = false;
             capturing      = false;
             inputText      = "";
+            capturedSignal.clear();
         }
-        else setStatus("Save failed!");
+        else
+        {
+            setStatus("Save failed!");
+        }
+        return;
     }
-    else if (key == 8 || key == 127)
+
+    if (key == 8 || key == 127)
     {
-        if (inputText.length() > 0) inputText.remove(inputText.length() - 1);
+        if (inputText.length() > 0)
+            inputText.remove(inputText.length() - 1);
     }
-    else if (key >= 32 && key <= 126 && inputText.length() < 20)
+    else if (key >= 32 && key <= 126 && (int)inputText.length() < 20)
     {
-        inputText += key;
+        // Geçersiz dosya adı karakterlerini filtrele
+        if (key != '/' && key != '\\' && key != ':' &&
+            key != '*' && key != '?' && key != '"' &&
+            key != '<' && key != '>' && key != '|')
+        {
+            inputText += key;
+        }
     }
 }
 
 void Cardputer_Remote::handleViewCode(char key)
 {
     if (key == '`' || key == 27)
+    {
         currentState = previousState;
+    }
     else if (key == 's' || key == 'S' || key == '\n' || key == '\r')
-        setStatus(sendIR(selectedSignal) ? "Signal sent!" : "Send failed!");
+    {
+        bool ok = sendIR(selectedSignal);
+        setStatus(ok ? "Signal sent!" : "Send failed!");
+    }
 }
 
 void Cardputer_Remote::handleSDBrowser(char key)
@@ -1565,32 +1799,53 @@ void Cardputer_Remote::handleSDBrowser(char key)
     if (key == '`' || key == 27)
     {
         currentState = STATE_MAIN_MENU;
+        return;
     }
-    else if (key == ';' && sdFileIndex > 0)
+
+    if (sdFiles.empty())
     {
-        sdFileIndex--;
+        if (key == 'r' || key == 'R')
+        {
+            scanSDFiles();
+            sdFileIndex = 0; scrollOffset = 0;
+            setStatus(String((int)sdFiles.size()) + " files found");
+        }
+        return;
     }
-    else if (key == '.' && sdFileIndex < (int)sdFiles.size()-1)
+
+    if (key == ';')
     {
-        sdFileIndex++;
+        if (sdFileIndex > 0) sdFileIndex--;
     }
-    else if ((key == '\n' || key == '\r' || key == ' ') && !sdFiles.empty())
+    else if (key == '.')
     {
+        if (sdFileIndex < (int)sdFiles.size() - 1) sdFileIndex++;
+    }
+    else if (key == '\n' || key == '\r' || key == ' ')
+    {
+        // FIX: Hem tekli hem çoklu dosyayı doğru aç
         IRSignal sig;
         if (loadSignalFromSD(sdFiles[sdFileIndex].path, sig))
         {
             selectedSignal = sig;
             previousState  = STATE_SD_BROWSER;
-            if (sig.isMulti && sig.commands.size() > 1)
+
+            if (sig.isMulti)
             {
                 remotePadIdx = 0;
                 currentState = STATE_REMOTE_PAD;
             }
-            else currentState = STATE_SEND_CONFIRM;
+            else
+            {
+                currentState = STATE_SEND_CONFIRM;
+            }
         }
-        else setStatus("Failed to load!");
+        else
+        {
+            setStatus("Load failed: " + sdFiles[sdFileIndex].path);
+        }
     }
-    else if ((key == 'v' || key == 'V') && !sdFiles.empty())
+    else if (key == 'v' || key == 'V')
     {
         IRSignal sig;
         if (loadSignalFromSD(sdFiles[sdFileIndex].path, sig))
@@ -1599,14 +1854,17 @@ void Cardputer_Remote::handleSDBrowser(char key)
             previousState  = STATE_SD_BROWSER;
             currentState   = STATE_VIEW_CODE;
         }
-        else setStatus("Failed to load!");
+        else
+        {
+            setStatus("Load failed!");
+        }
     }
     else if (key == 'r' || key == 'R')
     {
         scanSDFiles();
         sdFileIndex  = 0;
         scrollOffset = 0;
-        setStatus(String(sdFiles.size()) + " files found");
+        setStatus(String((int)sdFiles.size()) + " files found");
     }
 }
 
@@ -1615,17 +1873,21 @@ void Cardputer_Remote::handleSendConfirm(char key)
     if (key == '`' || key == 27)
     {
         currentState = previousState;
+        return;
     }
-    else if (key == '\n' || key == '\r' || key == ' ' || key == 's' || key == 'S')
+
+    if (key == '\n' || key == '\r' || key == ' ' ||
+        key == 's' || key == 'S')
     {
+        // Gönder animasyonu göster
         mainOS->sprite.fillScreen(COLOR_BG);
-        drawTopBar("TRANSMIT");
         drawSendConfirm(true);
-        drawToast();
         mainOS->sprite.pushSprite(0, 0);
+
         bool ok = sendIR(selectedSignal);
-        delay(400);
-        setStatus(ok ? "Sent successfully!" : "Send failed!");
+        delay(300);
+
+        setStatus(ok ? "Sent OK!" : "Send failed!");
         currentState = previousState;
     }
 }
@@ -1633,8 +1895,12 @@ void Cardputer_Remote::handleSendConfirm(char key)
 void Cardputer_Remote::handleSettings(char key)
 {
     if (key == '`' || key == 27)
+    {
         currentState = STATE_MAIN_MENU;
-    else if (key == ';' || key == ',')
+        return;
+    }
+
+    if (key == ';' || key == ',')
         settingsIndex = 0;
     else if (key == '.' || key == '/')
         settingsIndex = 1;
@@ -1642,39 +1908,50 @@ void Cardputer_Remote::handleSettings(char key)
     {
         if (settingsIndex == 0 && !usePin44)
         {
-            usePin44 = true; sendPin = 44;
+            usePin44 = true;
+            sendPin  = 44;
             reinitIRSend();
-            setStatus("Sender pin set to G44");
+            setStatus("Pin set to G44");
         }
         else if (settingsIndex == 1 && usePin44)
         {
-            usePin44 = false; sendPin = 2;
+            usePin44 = false;
+            sendPin  = 2;
             reinitIRSend();
-            setStatus("Sender pin set to G2");
+            setStatus("Pin set to G2");
         }
-        else setStatus(usePin44 ? "G44 already active" : "G2 already active");
+        else
+        {
+            setStatus(usePin44 ? "G44 already active" : "G2 already active");
+        }
     }
 }
 
 void Cardputer_Remote::handleRemotePad(char key)
 {
     int cmdCount = (int)selectedSignal.commands.size();
-    if (cmdCount == 0) { currentState = previousState; return; }
+    if (cmdCount == 0)
+    {
+        currentState = previousState;
+        return;
+    }
 
     int cols = 3;
-    if (cmdCount <= 2) cols = cmdCount;
-    if (cmdCount >= 9) cols = 4;
     if (cmdCount == 1) cols = 1;
+    else if (cmdCount <= 2) cols = 2;
+    else if (cmdCount >= 9) cols = 4;
 
     if (key == '`' || key == 27)
+    {
         currentState = previousState;
+    }
     else if (key == ',')   // Sol
     {
         if (remotePadIdx % cols > 0) remotePadIdx--;
     }
     else if (key == '/')   // Sağ
     {
-        if (remotePadIdx % cols < cols-1 && remotePadIdx+1 < cmdCount)
+        if (remotePadIdx % cols < cols - 1 && remotePadIdx + 1 < cmdCount)
             remotePadIdx++;
     }
     else if (key == ';')   // Yukarı
@@ -1687,9 +1964,16 @@ void Cardputer_Remote::handleRemotePad(char key)
     }
     else if (key == '\n' || key == '\r' || key == ' ')
     {
+        // Bounds check
+        if (remotePadIdx < 0 || remotePadIdx >= cmdCount) return;
+
+        String lbl = selectedSignal.commands[remotePadIdx].label;
+
         // Gönder animasyonu
         mainOS->sprite.fillScreen(COLOR_BG);
-        drawTopBar("TRANSMIT");
+        drawTopBar(selectedSignal.name.length() > 16
+                   ? selectedSignal.name.substring(0, 16)
+                   : selectedSignal.name);
         mainOS->sprite.setFont(&fonts::Font0);
         mainOS->sprite.setTextSize(2);
         mainOS->sprite.setTextColor(COLOR_SUCCESS);
@@ -1698,12 +1982,14 @@ void Cardputer_Remote::handleRemotePad(char key)
         mainOS->sprite.setTextSize(1);
         mainOS->sprite.setTextColor(0x888888);
         mainOS->sprite.setCursor(50, 82);
-        String lbl = selectedSignal.commands[remotePadIdx].label;
-        mainOS->sprite.print("Sending: " + lbl);
+        String sendTxt = "Sending: " + lbl;
+        if ((int)sendTxt.length() > 30) sendTxt = sendTxt.substring(0, 30);
+        mainOS->sprite.print(sendTxt);
         mainOS->sprite.pushSprite(0, 0);
 
         bool ok = sendIRCommand(selectedSignal.commands[remotePadIdx]);
-        delay(200);
+        delay(150);
+
         setStatus(ok ? (lbl + " sent!") : "Send failed!");
         needsRedraw = true;
     }
