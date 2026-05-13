@@ -23,6 +23,7 @@
 
 #define ITEM_H       28
 #define MENU_START_Y 28
+#define MAX_RAW_LEN  200   // Bellek koruması
 
 #ifndef SCREEN_W
   #define SCREEN_W 240
@@ -48,37 +49,46 @@ enum AppState
 };
 
 // ----------------------------------------------------------------
-// Tek bir IR komutu  (Flipper .ir dosyasındaki bir blok)
+// Tek bir IR komutu
 // ----------------------------------------------------------------
 struct IRCommand
 {
-    String   label;        // name: satırı
-    String   type;         // "parsed" veya "raw"
-    String   protocol;     // NEC, SAMSUNG, vb.
-    uint32_t address;      // address: alanı (parsed)
-    uint32_t command;      // command: alanı (parsed)
-    uint32_t frequency;    // raw için
-    float    dutyCycle;    // raw için
-    std::vector<uint16_t> rawData;  // raw için data:
+    String   label    = "";
+    String   type     = "parsed";
+    String   protocol = "";
+    uint32_t address  = 0;
+    uint32_t command  = 0;
+    uint32_t frequency= 38000;
+    float    dutyCycle= 0.33f;
+    std::vector<uint16_t> rawData;
+
+    IRCommand() {}
 };
 
 // ----------------------------------------------------------------
-// IR sinyal dosyası  (bir .ir dosyası = birden fazla komut)
+// IR sinyal dosyası
 // ----------------------------------------------------------------
 struct IRSignal
 {
-    String   name;         // Dosya/grup adı
-    String   filename;     // SD'deki tam yol
-    bool     isMulti;      // Birden fazla komut var mı?
+    String   name     = "";
+    String   filename = "";
+    bool     isMulti  = false;
+    bool     isRaw    = false;
+    String   protocol = "";
+    uint32_t address  = 0;
+    uint32_t command  = 0;
+    uint32_t frequency= 38000;
     std::vector<IRCommand> commands;
+    std::vector<uint16_t>  rawData;
 
-    // Hızlı erişim (ilk komut veya tek komut)
-    String   protocol;
-    uint32_t address;
-    uint32_t command;
-    uint32_t frequency;
-    bool     isRaw;
-    std::vector<uint16_t> rawData;
+    void clear() {
+        name = filename = protocol = "";
+        isMulti = isRaw = false;
+        address = command = 0;
+        frequency = 38000;
+        commands.clear();
+        rawData.clear();
+    }
 };
 
 // ----------------------------------------------------------------
@@ -86,10 +96,10 @@ struct IRSignal
 // ----------------------------------------------------------------
 struct SDFileInfo
 {
-    String path;
-    String displayName;
-    bool   isMulti;
-    int    cmdCount;
+    String path        = "";
+    String displayName = "";
+    bool   isMulti     = false;
+    int    cmdCount    = 0;
 };
 
 // ================================================================
@@ -132,6 +142,7 @@ private:
     // Capture
     bool capturing      = false;
     bool signalCaptured = false;
+    bool spriteCreated  = false;  // FIX: double-create koruması
 
     // Giriş & durum
     String        inputText  = "";
@@ -144,7 +155,7 @@ private:
     // Ayarlar
     uint8_t sendPin  = IR_SEND_PIN_DEFAULT;
     bool    usePin44 = true;
-    bool    sdAvailable = true;
+    bool    sdAvailable = false;
 
     // Menü
     static const int MAIN_MENU_COUNT = 3;
@@ -158,17 +169,18 @@ private:
     };
 
     // ---- Yardımcı ----
-    void    setStatus(String msg);
-    String  protoName(decode_type_t p);
-    String  protoNameFromStr(String p); // görüntü için
+    void          setStatus(String msg);
+    String        protoName(decode_type_t p);
     decode_type_t strToProto(String s);
+    static String trimStr(String s);
+    static uint32_t parseHexBytes(String s);
 
     // ---- Flipper IR format ----
     bool    saveSignalToSD(IRSignal &sig);
-    bool    loadSignalFromSD(String filename, IRSignal &sig);
+    bool    loadSignalFromSD(const String &filename, IRSignal &sig);
     void    scanSDFiles();
-    void    scanSDRecursive(File dir, const String &basePath);
-    bool    deleteFromSD(String fn);
+    void    scanSDRecursive(const String &dirPath, int depth = 0);
+    bool    deleteFromSD(const String &fn);
     bool    initSD();
 
     // ---- IR gönder ----
@@ -177,9 +189,9 @@ private:
     void    reinitIRSend();
 
     // ---- Draw ----
-    void    drawTopBar(String title);
+    void    drawTopBar(const String &title);
     void    drawToast();
-    void    drawBottomBar(String hint);
+    void    drawBottomBar(const String &hint);
     void    drawMainMenu();
     void    drawCaptureScreen();
     void    drawSavePrompt();
